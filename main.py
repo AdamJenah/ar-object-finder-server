@@ -32,24 +32,28 @@ async def infer(
     object: str | None = Form(default=None),
     color:  str | None = Form(default=None),
     use_pose: str | None = Form(default="false"),
-    target_clothing: str | None = Form(default=None)
+    target_clothing: str | None = Form(default=None),
+    conf_thresh: float | None = Form(default=None),   # ← renamed & typed
 ):
     img_bytes = await image.read()
     bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
         return {"error":"invalid_image"}
 
-    # Objects detection (always)
+    # objects (always)
     inp, r, dw, dh = preprocess_bgr_to_yolo_input(bgr, size=INPUT_SIZE)
     det_out = obj_session.run(None, {obj_session.get_inputs()[0].name: inp})
 
+    # pick threshold (fallback to env)
+    th = CONF_THRES if conf_thresh is None else float(conf_thresh)
 
     detections = postprocess(
         det_out, bgr.shape, r, dw, dh,
-        conf_thres=(conf if conf is not None else CONF_THRES),
-        input_size=INPUT_SIZE,           # <<< important
-        names=None                       # or your class list if custom
+        conf_thres=th,
+        input_size=INPUT_SIZE,
+        names=None  # or pass your class list if you have one
     )
+
 
 
     response = {"mode":"objects", "match": None, "detections": detections}
