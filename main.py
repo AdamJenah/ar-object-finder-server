@@ -46,6 +46,7 @@ async def infer(
     for d in detections:
         d["color"] = bbox_color_name(bgr, d["bbox"])
 
+
     response = {"mode":"objects", "match": None, "detections": detections}
 
     # Optional: pose branch
