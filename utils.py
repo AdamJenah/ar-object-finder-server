@@ -170,66 +170,50 @@ def _decode_decoupled(boxes, scores, conf_thres, input_size):
 
     return [("decoupled", x1[ok],y1[ok],x2[ok],y2[ok], conf[keep][ok], cls_id[keep][ok])]
 
-def postprocess(det_out, orig_shape, r, dw, dh, conf_thres=0.25, iou_thres=0.45, names=None, input_size=640):
+def postprocess_onnx_nms(outputs, orig_shape, r, dw, dh, score_thres=0.25, names=None):
     """
-    Supports:
-      • fused: one tensor (P, 4+K) or (P, 5+K)
-      • decoupled: two tensors (P,4) and (P,K)
-      • xyxy or cxcywh; normalized or pixels
+    Parse ONNX exported with nms=True.
+    outputs[0].shape == (1, num, 6): [x1,y1,x2,y2,score,class_id] in letterboxed pixels.
+    Return [{"bbox":[x,y,w,h], "conf":score, "class_id":k, "label": name}, ...] in ORIGINAL image pixels.
     """
     H0, W0 = orig_shape[:2]
-    outs = [np.array(o) for o in det_out]
-
-    # Try decode paths
-    candidates = []
-    if len(outs) == 1:
-        candidates += (_decode_fused(outs[0], conf_thres, input_size) or [])
-    elif len(outs) >= 2:
-        # find boxes and scores tensors by last-dim
-        flat = [(i, a.reshape(a.shape[0], -1) if a.ndim >= 2 else a) for i,a in enumerate(outs)]
-        best_boxes = None; best_scores = None
-        for i,a in enumerate(outs):
-            shp = a.shape
-            last = shp[-1] if len(shp)>0 else 0
-            if last == 4: best_boxes = a
-            elif last >= 6: best_scores = a
-        if best_boxes is not None and best_scores is not None:
-            candidates += (_decode_decoupled(best_boxes, best_scores, conf_thres, input_size) or [])
-        # also try treating first tensor as fused (some exports still do)
-        candidates += (_decode_fused(outs[0], conf_thres, input_size) or [])
-
-    if not candidates:
+    out = np.array(outputs[0])
+    if out.ndim != 3 or out.shape[2] < 6:
         return []
 
-    # Choose the variant that yields the biggest, non-corner boxes
-    def score_variant(x1,y1,x2,y2):
-        w = x2 - x1; h = y2 - y1
-        area = np.mean(w*h)
-        corner = np.mean((x1 < 5) & (y1 < 5))
-        return area - 1000*corner
+    dets = out[0]  # (num, 6)
+    if dets.size == 0:
+        return []
 
-    best = max(candidates, key=lambda c: score_variant(c[1],c[2],c[3],c[4]))
-    _, x1,y1,x2,y2, conf, cls_id = best
+    x1, y1, x2, y2, score, cid = dets[:,0], dets[:,1], dets[:,2], dets[:,3], dets[:,4], dets[:,5].astype(int)
 
-    # Undo letterbox to original image
-    x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
-    boxes_xyxy = np.stack([x1,y1,x2,y2], axis=1)
+    # filter by score
+    keep = score >= score_thres
+    if not np.any(keep):
+        return []
+    x1, y1, x2, y2, score, cid = x1[keep], y1[keep], x2[keep], y2[keep], score[keep], cid[keep]
 
-    # NMS
-    if boxes_xyxy.shape[0] > 1:
-        keep = _nms(boxes_xyxy, conf, iou_thres=iou_thres)
-        boxes_xyxy = boxes_xyxy[keep]; conf = conf[keep]; cls_id = cls_id[keep]
+    # undo letterbox
+    x1 = (x1 - dw) / r;  y1 = (y1 - dh) / r
+    x2 = (x2 - dw) / r;  y2 = (y2 - dh) / r
 
-    # Package
-    dets = []
-    for (xa,ya,xb,yb), c, k in zip(boxes_xyxy, conf, cls_id):
+    # clip
+    x1 = np.clip(x1, 0, W0-1); y1 = np.clip(y1, 0, H0-1)
+    x2 = np.clip(x2, 0, W0-1); y2 = np.clip(y2, 0, H0-1)
+
+    results = []
+    for xa, ya, xb, yb, s, k in zip(x1, y1, x2, y2, score, cid):
         w = max(0.0, xb - xa); h = max(0.0, yb - ya)
         if w < 2 or h < 2: 
             continue
-        label = str(int(k)) if not names or int(k) >= len(names) else names[int(k)]
-        dets.append({"bbox":[int(xa),int(ya),int(w),int(h)],
-                     "conf": float(c), "class_id": int(k), "label": label})
-    return dets
+        label = (names[k] if names and 0 <= k < len(names) else str(int(k)))
+        results.append({
+            "bbox": [int(xa), int(ya), int(w), int(h)],
+            "conf": float(s),
+            "class_id": int(k),
+            "label": label
+        })
+    return results
 
 
 # --------- Color naming ---------

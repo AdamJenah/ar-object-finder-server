@@ -44,15 +44,14 @@ async def infer(
     inp, r, dw, dh = preprocess_bgr_to_yolo_input(bgr, size=INPUT_SIZE)
     det_out = obj_session.run(None, {obj_session.get_inputs()[0].name: inp})
 
-    # pick threshold (fallback to env)
-    th = CONF_THRES if conf_thresh is None else float(conf_thresh)
+    # If you added a client slider 'conf_thresh', use it; else fall back to CONF_THRES
+    score_thres = conf_thresh if conf_thresh is not None else CONF_THRES
 
-    detections = postprocess(
-        det_out, bgr.shape, r, dw, dh,
-        conf_thres=th,
-        input_size=INPUT_SIZE,
-        names=None  # or pass your class list if you have one
-    )
+    detections = postprocess_onnx_nms(det_out, bgr.shape, r, dw, dh, score_thres=score_thres, names=None)  # pass your class list if custom
+
+    # add ROI color
+    for d in detections:
+        d["color"] = bbox_color_name(bgr, d["bbox"])
 
 
 
