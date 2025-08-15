@@ -217,43 +217,63 @@ def postprocess_onnx_nms(outputs, orig_shape, r, dw, dh, score_thres=0.25, names
 
 
 # --------- Color naming ---------
-def bbox_color_name(bgr, bbox):
+def bbox_color_name(bgr, bbox, inset_ratio=0.08):
     """
-    Returns a coarse color name from the ROI average in HSV.
+    Robust color naming:
+    - Ignores a border around the box (to avoid client-drawn overlays or edges)
+    - Uses dominant hue weighted by saturation, not a simple average
+    - Handles black/white/gray as special cases
     """
     x, y, w, h = map(int, bbox)
     H, W = bgr.shape[:2]
-    if w <= 1 or h <= 1:
+    if w <= 2 or h <= 2:
         return None
-    x = max(0, min(x, W - 1))
-    y = max(0, min(y, H - 1))
-    w = max(1, min(w, W - x))
-    h = max(1, min(h, H - y))
-    roi = bgr[y:y + h, x:x + w]
+
+    # Inset ROI to avoid borders/box strokes (e.g., Streamlit's lime outline)
+    dx = int(w * inset_ratio * 0.5)
+    dy = int(h * inset_ratio * 0.5)
+    xi = max(0, min(W - 1, x + dx))
+    yi = max(0, min(H - 1, y + dy))
+    wi = max(1, min(W - xi, w - 2 * dx))
+    hi = max(1, min(H - yi, h - 2 * dy))
+
+    roi = bgr[yi:yi + hi, xi:xi + wi]
     if roi.size == 0:
         return None
 
-    # Average HSV
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    mean_h, mean_s, mean_v = hsv.reshape(-1, 3).mean(axis=0)
+    # Light blur to reduce noise
+    roi = cv2.GaussianBlur(roi, (3, 3), 0)
 
-    # Simple buckets
-    if mean_v < 50:
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    Hc = hsv[..., 0]  # 0..180
+    S  = hsv[..., 1]  # 0..255
+    V  = hsv[..., 2]  # 0..255
+
+    # Grayscale buckets first
+    if np.mean(V) < 45:
         return "black"
-    if mean_s < 40 and mean_v > 200:
-        return "white"
-    if mean_s < 40:
+    if np.mean(S) < 28:  # low saturation overall
+        return "white" if np.mean(V) > 200 else "gray"
+
+    # Mask out very low saturation / value pixels before hue voting
+    mask = (S >= 30) & (V >= 40)
+    if not np.any(mask):
         return "gray"
-    if mean_h < 10 or mean_h >= 170:
-        return "red"
-    if 10 <= mean_h < 25:
-        return "orange"
-    if 25 <= mean_h < 35:
-        return "yellow"
-    if 35 <= mean_h < 85:
-        return "green"
-    if 85 <= mean_h < 130:
-        return "blue"
-    if 130 <= mean_h < 160:
-        return "purple"
+
+    Hm = Hc[mask].astype(np.int32)
+    Sw = S[mask].astype(np.float32)
+
+    # Hue histogram weighted by saturation (stronger colors count more)
+    # OpenCV hue range is 0..180
+    hist = np.bincount(Hm, weights=Sw, minlength=181)
+    h_mode = int(hist.argmax())
+
+    # Map hue to color name
+    # (bounds tuned for OpenCV HSV; tweak as you like)
+    if h_mode < 10 or h_mode >= 170: return "red"
+    if h_mode < 25:  return "orange"
+    if h_mode < 35:  return "yellow"
+    if h_mode < 85:  return "green"
+    if h_mode < 125: return "blue"
+    if h_mode < 150: return "purple"
     return "pink"
