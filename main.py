@@ -42,6 +42,14 @@ async def infer(
     # Objects detection (always)
     inp, r, dw, dh = preprocess_bgr_to_yolo_input(bgr, size=INPUT_SIZE)
     det_out = obj_session.run(None, {obj_session.get_inputs()[0].name: inp})
+
+    # DEBUG (remove after)
+    import numpy as np
+    shapes = [np.array(o).shape for o in det_out]
+    print("ONNX out shapes:", shapes, flush=True)
+    sample = np.array(det_out[0])
+    print("ONNX sample (first 3 rows, 10 cols):", sample.reshape(sample.shape[0], -1)[:3, :10], flush=True)
+
     detections = postprocess(det_out, bgr.shape, r, dw, dh, conf_thres=CONF_THRES)
     for d in detections:
         d["color"] = bbox_color_name(bgr, d["bbox"])
