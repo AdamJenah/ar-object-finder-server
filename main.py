@@ -1,7 +1,7 @@
 import os, cv2, numpy as np, onnxruntime as ort
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from utils import preprocess_bgr_to_yolo_input, postprocess_onnx_nms, bbox_color_name
+from utils import preprocess_bgr_to_yolo_input, postprocess_onnx_nms, bbox_color_name, COCO_CLASSES
 from pose_utils import run_pose, clothing_rois_from_keypoints
 
 OBJ_MODEL_PATH  = os.getenv("OBJ_MODEL_PATH",  "models/yolov12n.onnx")
@@ -47,7 +47,7 @@ async def infer(
     # If you added a client slider 'conf_thresh', use it; else fall back to CONF_THRES
     score_thres = conf_thresh if conf_thresh is not None else CONF_THRES
 
-    detections = postprocess_onnx_nms(det_out, bgr.shape, r, dw, dh, score_thres=score_thres, names=None)  # pass your class list if custom
+    detections = postprocess_onnx_nms(det_out, bgr.shape, r, dw, dh, score_thres=score_thres, names=COCO_CLASSES)  # pass your class list if custom
 
     # add ROI color
     for d in detections:
@@ -55,20 +55,41 @@ async def infer(
 
     response = {"mode":"objects", "match": None, "detections": detections}
 
+    def norm(s): 
+        return (s or "").strip().lower()
+
+    obj_q = norm(object)
+    col_q = norm(color)
+
+    if response["mode"] == "objects" and (obj_q or col_q):
+        response["match"] = False
+        for d in detections:
+            lbl = norm(d.get("label"))
+            col = norm(d.get("color"))
+            obj_ok = (not obj_q) or (obj_q in lbl)  # substring
+            col_ok = (not col_q) or (col_q == col)  # strict
+            if obj_ok and col_ok:
+                response["match"] = True
+                response["matched_detection"] = d
+                break
+
     # Optional: pose branch
-    if (use_pose == "true") and (target_clothing in {"shirt","pants"}):
-        people = run_pose(pose_session, bgr)  # TODO: implement parsing in pose_utils.run_pose
-        rois = clothing_rois_from_keypoints(people, target=target_clothing)
+    pose_on = str(use_pose or "").lower() == "true"
+    tgt = (target_clothing or "").strip().lower()
+    if pose_on:
+        if tgt not in {"shirt", "pants"}:
+            tgt = "shirt"   # sensible default so pose still runs
+        people = run_pose(pose_session, bgr)  # make sure this returns keypoints!
+        rois = clothing_rois_from_keypoints(people, target=tgt)
         clothing_hits = []
         for roi in rois:
             col = bbox_color_name(bgr, roi)
-            clothing_hits.append({"target": target_clothing, "color": col, "bbox": roi})
+            clothing_hits.append({"target": tgt, "color": col, "bbox": roi})
         response["mode"] = "pose"
         response["pose"] = {"clothing": clothing_hits}
-        if color:
-            response["match"] = any(hit["color"] == color for hit in clothing_hits)
-        else:
-            response["match"] = len(clothing_hits) > 0
+        # pose match: color optional
+        response["match"] = (any(norm(h["color"]) == col_q for h in clothing_hits) 
+                            if col_q else len(clothing_hits) > 0)
 
     # Object+color prompt match (when not using pose)
     if response["mode"] == "objects" and (object or color):
