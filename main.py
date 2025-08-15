@@ -1,7 +1,7 @@
 import os, cv2, numpy as np, onnxruntime as ort
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from utils import preprocess_bgr_to_yolo_input, postprocess, bbox_color_name
+from utils import preprocess_bgr_to_yolo_input, postprocess_onnx_nms, bbox_color_name
 from pose_utils import run_pose, clothing_rois_from_keypoints
 
 OBJ_MODEL_PATH  = os.getenv("OBJ_MODEL_PATH",  "models/yolov12n.onnx")
