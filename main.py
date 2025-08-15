@@ -44,9 +44,12 @@ async def infer(
     det_out = obj_session.run(None, {obj_session.get_inputs()[0].name: inp})
 
 
-    detections = postprocess(det_out, bgr.shape, r, dw, dh, conf_thres=CONF_THRES)
-    for d in detections:
-        d["color"] = bbox_color_name(bgr, d["bbox"])
+    detections = postprocess(
+        det_out, bgr.shape, r, dw, dh,
+        conf_thres=(conf if conf is not None else CONF_THRES),
+        input_size=INPUT_SIZE,           # <<< important
+        names=None                       # or your class list if custom
+    )
 
 
     response = {"mode":"objects", "match": None, "detections": detections}

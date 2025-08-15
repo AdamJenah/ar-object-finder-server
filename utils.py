@@ -62,8 +62,7 @@ def _nms(boxes, scores, iou_thres=0.45):
     while idxs.size > 0:
         i = idxs[0]
         keep.append(i)
-        if idxs.size == 1:
-            break
+        if idxs.size == 1: break
         ious = _iou(boxes[i], boxes[idxs[1:]])
         idxs = idxs[1:][ious < iou_thres]
     return keep
@@ -75,44 +74,13 @@ def _undo_letterbox_xyxy(x1, y1, x2, y2, r, dw, dh, W0, H0):
     x2 = np.clip(x2, 0, W0 - 1); y2 = np.clip(y2, 0, H0 - 1)
     return x1, y1, x2, y2
 
-def _decode_one_layout(coords, scores_block, has_obj, conf_thres, input_size=640):
-    """
-    coords: (P,4) raw coords (could be cxcywh or xyxy; normalized or absolute)
-    scores_block:
-      - if has_obj=True: obj column is scores_block[:,0], cls are scores_block[:,1:]
-      - if has_obj=False: cls are scores_block (no obj)
-    returns (x1,y1,x2,y2, conf, cls_id) or None if nothing good
-    """
-    P = coords.shape[0]
-    if P == 0:
-        return None
+def _needs_sigmoid(arr):
+    return (np.mean(arr < 0) > 0.01) or (np.mean(arr > 1.5) > 0.01)
 
-    if has_obj:
-        obj = scores_block[:, 0].astype(np.float32)
-        cls = scores_block[:, 1:].astype(np.float32)
-        # apply sigmoid if they look like logits
-        if (np.mean(obj < 0) > 0.01) or (np.mean(obj > 1.5) > 0.01):
-            obj = _sigmoid(obj)
-        if (np.mean(cls < 0) > 0.01) or (np.mean(cls > 1.5) > 0.01):
-            cls = _sigmoid(cls)
-        cls_id = cls.argmax(axis=1)
-        cls_score = cls.max(axis=1)
-        conf = obj * cls_score
-    else:
-        cls = scores_block.astype(np.float32)
-        if (np.mean(cls < 0) > 0.01) or (np.mean(cls > 1.5) > 0.01):
-            cls = _sigmoid(cls)
-        cls_id = cls.argmax(axis=1)
-        conf = cls.max(axis=1)
-
-    keep = conf >= conf_thres
-    if not np.any(keep):
-        return None
-    coords = coords[keep]
-    conf   = conf[keep]
-    cls_id = cls_id[keep]
-
-    # Decide coord format & scale to letterbox size if normalized
+def _coords_to_xyxy(coords, input_size):
+    """Auto-handle xyxy vs cxcywh, normalized vs absolute."""
+    coords = coords.astype(np.float32)
+    # Heuristic: if many rows satisfy x2>x1 & y2>y1, treat as xyxy
     xyxy_like = np.mean((coords[:,2] > coords[:,0]) & (coords[:,3] > coords[:,1])) > 0.5
     if xyxy_like:
         x1, y1, x2, y2 = coords[:,0], coords[:,1], coords[:,2], coords[:,3]
@@ -123,87 +91,144 @@ def _decode_one_layout(coords, scores_block, has_obj, conf_thres, input_size=640
         if float(np.max(coords)) <= 1.5:
             cx *= input_size; cy *= input_size; w *= input_size; h *= input_size
         x1 = cx - w/2; y1 = cy - h/2; x2 = cx + w/2; y2 = cy + h/2
+    return x1, y1, x2, y2
 
-    # discard clearly degenerate before returning
-    w = x2 - x1; h = y2 - y1
-    ok = (w >= 2) & (h >= 2)
-    if not np.any(ok):
+def _reshape_pred(a):
+    """Return (P, C) for any (N,P,C), (P,C), or (C,P)."""
+    a = np.array(a)
+    if a.ndim == 3:
+        a = a[0]
+    if a.shape[0] < a.shape[1] and a.shape[0] <= 10:
+        a = a.T
+    return a
+
+def _decode_fused(fused, conf_thres, input_size):
+    """Fused layout: (P, 4+K) or (P, 5+K) with/without obj."""
+    fused = _reshape_pred(fused)
+    if fused.shape[1] < 6:
+        return None
+    coords = fused[:, :4]
+    rest   = fused[:, 4:]
+
+    # try with obj and without obj; pick better
+    cands = []
+
+    # with objectness
+    if rest.shape[1] >= 2:
+        obj = rest[:, 0]
+        cls = rest[:, 1:]
+        if _needs_sigmoid(obj): obj = _sigmoid(obj)
+        if _needs_sigmoid(cls): cls = _sigmoid(cls)
+        cls_id = cls.argmax(axis=1); cls_score = cls.max(axis=1)
+        conf = obj * cls_score
+        keep = conf >= conf_thres
+        if np.any(keep):
+            x1,y1,x2,y2 = _coords_to_xyxy(coords[keep], input_size)
+            w = x2 - x1; h = y2 - y1
+            ok = (w >= 2) & (h >= 2)
+            if np.any(ok):
+                cands.append(("fused+obj", x1[ok],y1[ok],x2[ok],y2[ok], conf[keep][ok], cls_id[keep][ok]))
+
+    # without objectness
+    cls = rest
+    if _needs_sigmoid(cls): cls = _sigmoid(cls)
+    cls_id = cls.argmax(axis=1); conf = cls.max(axis=1)
+    keep = conf >= conf_thres
+    if np.any(keep):
+        x1,y1,x2,y2 = _coords_to_xyxy(coords[keep], input_size)
+        w = x2 - x1; h = y2 - y1
+        ok = (w >= 2) & (h >= 2)
+        if np.any(ok):
+            cands.append(("fused-noobj", x1[ok],y1[ok],x2[ok],y2[ok], conf[keep][ok], cls_id[keep][ok]))
+
+    return cands or None
+
+def _decode_decoupled(boxes, scores, conf_thres, input_size):
+    """Two-output layout: boxes (P,4) & scores (P,K), arbitrary transposes."""
+    boxes = np.array(boxes); scores = np.array(scores)
+
+    # move to (P,4) and (P,K)
+    if boxes.ndim == 3: boxes = boxes[0]
+    if scores.ndim == 3: scores = scores[0]
+    if boxes.shape[0] == 4 and boxes.shape[1] != 4: boxes = boxes.T
+    if scores.shape[0] < scores.shape[1] and scores.shape[0] <= 10: scores = scores.T
+
+    if boxes.shape[1] != 4 or scores.ndim != 2: 
         return None
 
-    return x1[ok], y1[ok], x2[ok], y2[ok], conf[ok], cls_id[ok]
+    if _needs_sigmoid(scores): scores = _sigmoid(scores)
+    cls_id = scores.argmax(axis=1); conf = scores.max(axis=1)
+    keep = conf >= conf_thres
+    if not np.any(keep): 
+        return None
 
-def postprocess(det_out, orig_shape, r, dw, dh, conf_thres=0.25, iou_thres=0.45, names=None):
+    x1,y1,x2,y2 = _coords_to_xyxy(boxes[keep], input_size)
+    w = x2 - x1; h = y2 - y1
+    ok = (w >= 2) & (h >= 2)
+    if not np.any(ok): 
+        return None
+
+    return [("decoupled", x1[ok],y1[ok],x2[ok],y2[ok], conf[keep][ok], cls_id[keep][ok])]
+
+def postprocess(det_out, orig_shape, r, dw, dh, conf_thres=0.25, iou_thres=0.45, names=None, input_size=640):
     """
-    Auto-detect **with or without objectness** column.
-    Handles (N,P,C), (P,C), or (C,P) shapes; cxcywh/xyxy; normalized/absolute.
+    Supports:
+      • fused: one tensor (P, 4+K) or (P, 5+K)
+      • decoupled: two tensors (P,4) and (P,K)
+      • xyxy or cxcywh; normalized or pixels
     """
     H0, W0 = orig_shape[:2]
-    out = np.array(det_out[0])
+    outs = [np.array(o) for o in det_out]
 
-    # reshape to (P, C)
-    if out.ndim == 3:
-        out = out[0]
-    if out.shape[0] < out.shape[1] and out.shape[0] <= 10:
-        out = out.T
-    if out.shape[1] < 6:     # must be at least 4+2 classes to be meaningful
+    # Try decode paths
+    candidates = []
+    if len(outs) == 1:
+        candidates += (_decode_fused(outs[0], conf_thres, input_size) or [])
+    elif len(outs) >= 2:
+        # find boxes and scores tensors by last-dim
+        flat = [(i, a.reshape(a.shape[0], -1) if a.ndim >= 2 else a) for i,a in enumerate(outs)]
+        best_boxes = None; best_scores = None
+        for i,a in enumerate(outs):
+            shp = a.shape
+            last = shp[-1] if len(shp)>0 else 0
+            if last == 4: best_boxes = a
+            elif last >= 6: best_scores = a
+        if best_boxes is not None and best_scores is not None:
+            candidates += (_decode_decoupled(best_boxes, best_scores, conf_thres, input_size) or [])
+        # also try treating first tensor as fused (some exports still do)
+        candidates += (_decode_fused(outs[0], conf_thres, input_size) or [])
+
+    if not candidates:
         return []
 
-    coords = out[:, :4].astype(np.float32)
-    rest   = out[:, 4:].astype(np.float32)
+    # Choose the variant that yields the biggest, non-corner boxes
+    def score_variant(x1,y1,x2,y2):
+        w = x2 - x1; h = y2 - y1
+        area = np.mean(w*h)
+        corner = np.mean((x1 < 5) & (y1 < 5))
+        return area - 1000*corner
 
-    # Try both layouts: w/ obj and w/o obj; pick the one that yields more valid boxes
-    cand = []
+    best = max(candidates, key=lambda c: score_variant(c[1],c[2],c[3],c[4]))
+    _, x1,y1,x2,y2, conf, cls_id = best
 
-    # Layout A: WITH objectness → rest[:,0] is obj, rest[:,1:] are classes
-    decodedA = _decode_one_layout(coords, rest, has_obj=True,  conf_thres=conf_thres)
-    if decodedA is not None:
-        x1,y1,x2,y2,conf,cls_id = decodedA
-        # undo letterbox
-        x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
-        boxesA = np.stack([x1,y1,x2,y2], axis=1)
-        cand.append(("A", boxesA, conf, cls_id))
-
-    # Layout B: NO objectness → rest are classes directly
-    decodedB = _decode_one_layout(coords, rest, has_obj=False, conf_thres=conf_thres)
-    if decodedB is not None:
-        x1,y1,x2,y2,conf,cls_id = decodedB
-        x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
-        boxesB = np.stack([x1,y1,x2,y2], axis=1)
-        cand.append(("B", boxesB, conf, cls_id))
-
-    if not cand:
-        return []
-
-    # Heuristic: choose the variant with more area & fewer corner-hugging boxes
-    def score_variant(boxes):
-        if boxes.shape[0] == 0: return -1e9
-        w = boxes[:,2]-boxes[:,0]; h = boxes[:,3]-boxes[:,1]
-        area = w*h
-        # penalize boxes stuck in (0,0)
-        corner_penalty = ((boxes[:,0] < 5) & (boxes[:,1] < 5)).mean()
-        return float(area.mean() - 1000*corner_penalty)
-
-    scored = [(name, boxes, conf, cls_id, score_variant(boxes)) for (name,boxes,conf,cls_id) in cand]
-    name, boxes_xyxy, conf, cls_id, _ = max(scored, key=lambda x: x[4])
+    # Undo letterbox to original image
+    x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
+    boxes_xyxy = np.stack([x1,y1,x2,y2], axis=1)
 
     # NMS
     if boxes_xyxy.shape[0] > 1:
-        keep_idx = _nms(boxes_xyxy, conf, iou_thres=iou_thres)
-        boxes_xyxy = boxes_xyxy[keep_idx]; conf = conf[keep_idx]; cls_id = cls_id[keep_idx]
+        keep = _nms(boxes_xyxy, conf, iou_thres=iou_thres)
+        boxes_xyxy = boxes_xyxy[keep]; conf = conf[keep]; cls_id = cls_id[keep]
 
-    # Pack results
+    # Package
     dets = []
-    for (xa, ya, xb, yb), c, k in zip(boxes_xyxy, conf, cls_id):
+    for (xa,ya,xb,yb), c, k in zip(boxes_xyxy, conf, cls_id):
         w = max(0.0, xb - xa); h = max(0.0, yb - ya)
         if w < 2 or h < 2: 
             continue
         label = str(int(k)) if not names or int(k) >= len(names) else names[int(k)]
-        dets.append({
-            "bbox": [int(xa), int(ya), int(w), int(h)],
-            "conf": float(c),
-            "class_id": int(k),
-            "label": label
-        })
+        dets.append({"bbox":[int(xa),int(ya),int(w),int(h)],
+                     "conf": float(c), "class_id": int(k), "label": label})
     return dets
 
 
