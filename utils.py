@@ -40,6 +40,7 @@ def preprocess_bgr_to_yolo_input(bgr, size=640):
     return x, r, dw, dh
 
 # --------- Helpers for postprocess ---------
+
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -50,9 +51,7 @@ def _iou(a, bs):
     inter_y1 = np.maximum(ay1, by1)
     inter_x2 = np.minimum(ax2, bx2)
     inter_y2 = np.minimum(ay2, by2)
-    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
-    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
-    inter = inter_w * inter_h
+    inter = np.maximum(0.0, inter_x2 - inter_x1) * np.maximum(0.0, inter_y2 - inter_y1)
     area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
     area_b = np.maximum(0.0, bx2 - bx1) * np.maximum(0.0, by2 - by1)
     return inter / (area_a + area_b - inter + 1e-9)
@@ -76,97 +75,137 @@ def _undo_letterbox_xyxy(x1, y1, x2, y2, r, dw, dh, W0, H0):
     x2 = np.clip(x2, 0, W0 - 1); y2 = np.clip(y2, 0, H0 - 1)
     return x1, y1, x2, y2
 
-# --------- Auto-detecting postprocess ---------
-def postprocess(det_out, orig_shape, r, dw, dh, conf_thres=0.25, iou_thres=0.45, names=COCO_CLASSES):
+def _decode_one_layout(coords, scores_block, has_obj, conf_thres, input_size=640):
     """
-    Robust YOLO-like decoder. Accepts:
-      - Output shaped (N, P, 5+nc) or (P, 5+nc) or (5+nc, P)
-      - Coords either cxcywh or xyxy
-      - Coords either normalized [0,1] or absolute [0, input_size]
-      - Obj/cls either logits or probs (auto-sigmoid if needed)
+    coords: (P,4) raw coords (could be cxcywh or xyxy; normalized or absolute)
+    scores_block:
+      - if has_obj=True: obj column is scores_block[:,0], cls are scores_block[:,1:]
+      - if has_obj=False: cls are scores_block (no obj)
+    returns (x1,y1,x2,y2, conf, cls_id) or None if nothing good
+    """
+    P = coords.shape[0]
+    if P == 0:
+        return None
 
-    Returns list of dicts:
-      {"bbox":[x,y,w,h], "conf":float, "class_id":int, "label":str}
-      bbox is in ORIGINAL image pixels (after unletterbox).
+    if has_obj:
+        obj = scores_block[:, 0].astype(np.float32)
+        cls = scores_block[:, 1:].astype(np.float32)
+        # apply sigmoid if they look like logits
+        if (np.mean(obj < 0) > 0.01) or (np.mean(obj > 1.5) > 0.01):
+            obj = _sigmoid(obj)
+        if (np.mean(cls < 0) > 0.01) or (np.mean(cls > 1.5) > 0.01):
+            cls = _sigmoid(cls)
+        cls_id = cls.argmax(axis=1)
+        cls_score = cls.max(axis=1)
+        conf = obj * cls_score
+    else:
+        cls = scores_block.astype(np.float32)
+        if (np.mean(cls < 0) > 0.01) or (np.mean(cls > 1.5) > 0.01):
+            cls = _sigmoid(cls)
+        cls_id = cls.argmax(axis=1)
+        conf = cls.max(axis=1)
+
+    keep = conf >= conf_thres
+    if not np.any(keep):
+        return None
+    coords = coords[keep]
+    conf   = conf[keep]
+    cls_id = cls_id[keep]
+
+    # Decide coord format & scale to letterbox size if normalized
+    xyxy_like = np.mean((coords[:,2] > coords[:,0]) & (coords[:,3] > coords[:,1])) > 0.5
+    if xyxy_like:
+        x1, y1, x2, y2 = coords[:,0], coords[:,1], coords[:,2], coords[:,3]
+        if float(np.max(coords)) <= 1.5:
+            x1 *= input_size; y1 *= input_size; x2 *= input_size; y2 *= input_size
+    else:
+        cx, cy, w, h = coords[:,0], coords[:,1], coords[:,2], coords[:,3]
+        if float(np.max(coords)) <= 1.5:
+            cx *= input_size; cy *= input_size; w *= input_size; h *= input_size
+        x1 = cx - w/2; y1 = cy - h/2; x2 = cx + w/2; y2 = cy + h/2
+
+    # discard clearly degenerate before returning
+    w = x2 - x1; h = y2 - y1
+    ok = (w >= 2) & (h >= 2)
+    if not np.any(ok):
+        return None
+
+    return x1[ok], y1[ok], x2[ok], y2[ok], conf[ok], cls_id[ok]
+
+def postprocess(det_out, orig_shape, r, dw, dh, conf_thres=0.25, iou_thres=0.45, names=None):
+    """
+    Auto-detect **with or without objectness** column.
+    Handles (N,P,C), (P,C), or (C,P) shapes; cxcywh/xyxy; normalized/absolute.
     """
     H0, W0 = orig_shape[:2]
     out = np.array(det_out[0])
 
-    # ---- reshape to (P, 5+nc)
-    if out.ndim == 3:    # (N, P, C)
+    # reshape to (P, C)
+    if out.ndim == 3:
         out = out[0]
     if out.shape[0] < out.shape[1] and out.shape[0] <= 10:
-        # (5+nc, P) -> (P, 5+nc)
         out = out.T
-    if out.shape[1] < 6:
+    if out.shape[1] < 6:     # must be at least 4+2 classes to be meaningful
         return []
 
     coords = out[:, :4].astype(np.float32)
-    obj = out[:, 4].astype(np.float32)
-    cls = out[:, 5:].astype(np.float32)
+    rest   = out[:, 4:].astype(np.float32)
 
-    # ---- auto-sigmoid if values look like logits
-    def needs_sigmoid(arr):
-        return (np.mean(arr < 0) > 0.01) or (np.mean(arr > 1.5) > 0.01)
+    # Try both layouts: w/ obj and w/o obj; pick the one that yields more valid boxes
+    cand = []
 
-    if needs_sigmoid(obj):
-        obj = _sigmoid(obj)
-    if needs_sigmoid(cls):
-        cls = _sigmoid(cls)
+    # Layout A: WITH objectness → rest[:,0] is obj, rest[:,1:] are classes
+    decodedA = _decode_one_layout(coords, rest, has_obj=True,  conf_thres=conf_thres)
+    if decodedA is not None:
+        x1,y1,x2,y2,conf,cls_id = decodedA
+        # undo letterbox
+        x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
+        boxesA = np.stack([x1,y1,x2,y2], axis=1)
+        cand.append(("A", boxesA, conf, cls_id))
 
-    cls_id = cls.argmax(axis=1)
-    cls_score = cls.max(axis=1)
-    conf = obj * cls_score
+    # Layout B: NO objectness → rest are classes directly
+    decodedB = _decode_one_layout(coords, rest, has_obj=False, conf_thres=conf_thres)
+    if decodedB is not None:
+        x1,y1,x2,y2,conf,cls_id = decodedB
+        x1,y1,x2,y2 = _undo_letterbox_xyxy(x1,y1,x2,y2, r, dw, dh, W0, H0)
+        boxesB = np.stack([x1,y1,x2,y2], axis=1)
+        cand.append(("B", boxesB, conf, cls_id))
 
-    keep = conf >= conf_thres
-    if not np.any(keep):
+    if not cand:
         return []
-    coords = coords[keep]; conf = conf[keep]; cls_id = cls_id[keep]
 
-    # ---- detect coord format & scale
-    # Heuristic: if many rows satisfy x2>x1 & y2>y1, likely xyxy
-    xyxy_like = np.mean((coords[:, 2] > coords[:, 0]) & (coords[:, 3] > coords[:, 1])) > 0.5
+    # Heuristic: choose the variant with more area & fewer corner-hugging boxes
+    def score_variant(boxes):
+        if boxes.shape[0] == 0: return -1e9
+        w = boxes[:,2]-boxes[:,0]; h = boxes[:,3]-boxes[:,1]
+        area = w*h
+        # penalize boxes stuck in (0,0)
+        corner_penalty = ((boxes[:,0] < 5) & (boxes[:,1] < 5)).mean()
+        return float(area.mean() - 1000*corner_penalty)
 
-    if xyxy_like:
-        x1, y1, x2, y2 = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
-        maxv = float(np.max(coords)) if coords.size else 0.0
-        # If normalized, scale to input size 640 (assumed)
-        if maxv <= 1.5:
-            x1 *= 640; y1 *= 640; x2 *= 640; y2 *= 640
-    else:
-        # assume cxcywh
-        cx, cy, w, h = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
-        maxv = float(np.max(coords)) if coords.size else 0.0
-        if maxv <= 1.5:  # normalized -> scale
-            cx *= 640; cy *= 640; w *= 640; h *= 640
-        x1 = cx - w / 2; y1 = cy - h / 2
-        x2 = cx + w / 2; y2 = cy + h / 2
+    scored = [(name, boxes, conf, cls_id, score_variant(boxes)) for (name,boxes,conf,cls_id) in cand]
+    name, boxes_xyxy, conf, cls_id, _ = max(scored, key=lambda x: x[4])
 
-    # ---- undo letterbox to original image
-    x1, y1, x2, y2 = _undo_letterbox_xyxy(x1, y1, x2, y2, r, dw, dh, W0, H0)
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
-
-    # ---- NMS
+    # NMS
     if boxes_xyxy.shape[0] > 1:
         keep_idx = _nms(boxes_xyxy, conf, iou_thres=iou_thres)
-        boxes_xyxy = boxes_xyxy[keep_idx]
-        conf = conf[keep_idx]
-        cls_id = cls_id[keep_idx]
+        boxes_xyxy = boxes_xyxy[keep_idx]; conf = conf[keep_idx]; cls_id = cls_id[keep_idx]
 
-    # ---- package
+    # Pack results
     dets = []
     for (xa, ya, xb, yb), c, k in zip(boxes_xyxy, conf, cls_id):
         w = max(0.0, xb - xa); h = max(0.0, yb - ya)
-        if w < 2 or h < 2:
+        if w < 2 or h < 2: 
             continue
-        lbl = names[int(k)] if (names and 0 <= int(k) < len(names)) else str(int(k))
+        label = str(int(k)) if not names or int(k) >= len(names) else names[int(k)]
         dets.append({
             "bbox": [int(xa), int(ya), int(w), int(h)],
             "conf": float(c),
             "class_id": int(k),
-            "label": lbl
+            "label": label
         })
     return dets
+
 
 # --------- Color naming ---------
 def bbox_color_name(bgr, bbox):
